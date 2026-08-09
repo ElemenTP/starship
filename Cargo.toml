@@ -32,6 +32,7 @@ The minimal, blazing-fast, and infinitely customizable prompt for any shell! ☄
 default = ["battery", "notify"]
 battery = ["starship-battery"]
 config-schema = ["schemars"]
+in-process = ["battery", "notify"]
 notify = ["notify-rust"]
 
 [dependencies]

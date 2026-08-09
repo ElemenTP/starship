@@ -20,6 +20,8 @@ pub mod module;
 mod modules;
 pub mod print;
 mod segment;
+#[cfg(feature = "in-process")]
+pub mod session;
 mod utils;
 
 #[cfg(test)]
