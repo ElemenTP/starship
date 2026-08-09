@@ -28,135 +28,104 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
 
     let repo = context.get_git_repo().ok()?;
     let gix_repo = repo.open();
-    gix_repo.workdir()?;
+    gix_repo.workdir()?; // Verify it's not a bare repo
     let status_module = context.new_module("git_status");
     let status_config = GitStatusConfig::try_load(status_module.config);
+
+    let mut stats: Option<GitDiff> = None;
+    // Check session cache for previously computed metrics.
+    #[cfg(feature = "in-process")]
+    let mut cache_avaliable = false;
+    #[cfg(feature = "in-process")]
+    if let Some(ref session) = context.session {
+        // Use the repo's workdir as cache key (from the persistent GitRepo struct,
+        // so we don't borrow gix_repo).
+        let cache_key = repo.workdir.as_deref().unwrap_or(&context.current_dir);
+        if let Some((cached_added, cached_deleted)) = session.get_git_metrics(cache_key) {
+            // Cache hit — skip the expensive blob-diff computation entirely.
+            // We still need to format the module, so fall through with cached values.
+            cache_avaliable = true;
+            stats = Some(GitDiff {
+                added: cached_added.to_string(),
+                deleted: cached_deleted.to_string(),
+            });
+        }
+    }
+
     // TODO: remove this special case once `gitoxide` can handle sparse indices for tree-index comparisons.
-    let stats = if repo.fs_monitor_value_is_true
-        || status_config.use_git_executable
-        || uses_reftables(&repo.repo.to_thread_local())
-        || gix_repo.index_or_empty().ok()?.is_sparse()
-    {
-        let mut git_args = vec!["diff", "--shortstat"];
-        if config.ignore_submodules {
-            git_args.push("--ignore-submodules");
-        }
-
-        let diff = repo.exec_git(context, &git_args)?.stdout;
-
-        GitDiff::parse(&diff)
-    } else {
-        #[derive(Default)]
-        struct Diff {
-            added: Saturating<u32>,
-            deleted: Saturating<u32>,
-        }
-        impl Diff {
-            fn add(&mut self, c: Option<gix::diff::blob::DiffLineStats>) {
-                let Some(c) = c else { return };
-                self.added += c.insertions;
-                self.deleted += c.removals;
+    if stats.is_none() {
+        stats = if repo.fs_monitor_value_is_true
+            || status_config.use_git_executable
+            || uses_reftables(&repo.repo.to_thread_local())
+            || gix_repo.index_or_empty().ok()?.is_sparse()
+        {
+            let mut git_args = vec!["diff", "--shortstat"];
+            if config.ignore_submodules {
+                git_args.push("--ignore-submodules");
             }
-        }
-        let status = super::git_status::get_static_repo_status(context, repo, &status_config)?;
-        let gix_repo = gix_repo.with_object_memory();
-        gix_repo.write_blob([]).ok()?; /* create empty blob */
-        let tree_index_cache = prevent_external_diff(
-            gix_repo
-                .diff_resource_cache(
-                    gix::diff::blob::pipeline::Mode::ToGit,
-                    WorktreeRoots::default(),
-                )
-                .ok()?,
-        );
-        let index_worktree_cache = prevent_external_diff(
-            gix_repo
-                .diff_resource_cache(
-                    gix::diff::blob::pipeline::Mode::ToGit,
-                    WorktreeRoots {
-                        old_root: None,
-                        new_root: gix_repo.workdir().map(ToOwned::to_owned),
+
+            let diff = repo.exec_git(context, &git_args)?.stdout;
+
+            Some(GitDiff::parse(&diff))
+        } else {
+            #[derive(Default)]
+            struct Diff {
+                added: Saturating<u32>,
+                deleted: Saturating<u32>,
+            }
+            impl Diff {
+                fn add(&mut self, c: Option<gix::diff::blob::DiffLineStats>) {
+                    let Some(c) = c else { return };
+                    self.added += c.insertions;
+                    self.deleted += c.removals;
+                }
+            }
+            let status = super::git_status::get_static_repo_status(context, repo, &status_config)?;
+            let gix_repo = gix_repo.with_object_memory();
+            gix_repo.write_blob([]).ok()?; /* create empty blob */
+            let tree_index_cache = prevent_external_diff(
+                gix_repo
+                    .diff_resource_cache(
+                        gix::diff::blob::pipeline::Mode::ToGit,
+                        WorktreeRoots::default(),
+                    )
+                    .ok()?,
+            );
+            let index_worktree_cache = prevent_external_diff(
+                gix_repo
+                    .diff_resource_cache(
+                        gix::diff::blob::pipeline::Mode::ToGit,
+                        WorktreeRoots {
+                            old_root: None,
+                            new_root: gix_repo.workdir().map(ToOwned::to_owned),
+                        },
+                    )
+                    .ok()?,
+            );
+            let diff = status
+                .changes
+                .par_iter()
+                .map_init(
+                    {
+                        let repo = gix_repo.into_sync();
+                        move || {
+                            let repo = repo.to_thread_local();
+                            (repo, tree_index_cache.clone(), index_worktree_cache.clone())
+                        }
                     },
-                )
-                .ok()?,
-        );
-        let diff = status
-            .changes
-            .par_iter()
-            .map_init(
-                {
-                    let repo = gix_repo.into_sync();
-                    move || {
-                        let repo = repo.to_thread_local();
-                        (repo, tree_index_cache.clone(), index_worktree_cache.clone())
-                    }
-                },
-                |(repo, tree_index_cache, index_worktree_cache), change| {
-                    use gix::status;
-                    let mut diff = Diff::default();
-                    match change {
-                        status::Item::TreeIndex(change) => {
-                            use gix::diff::index::Change;
-                            match change {
-                                Change::Addition {
-                                    entry_mode,
-                                    location,
-                                    id,
-                                    ..
-                                } => {
-                                    diff.added += count_lines(
+                    |(repo, tree_index_cache, index_worktree_cache), change| {
+                        use gix::status;
+                        let mut diff = Diff::default();
+                        match change {
+                            status::Item::TreeIndex(change) => {
+                                use gix::diff::index::Change;
+                                match change {
+                                    Change::Addition {
+                                        entry_mode,
                                         location,
-                                        id.as_ref().into(),
-                                        *entry_mode,
-                                        tree_index_cache,
-                                        repo,
-                                    );
-                                }
-                                Change::Deletion {
-                                    entry_mode,
-                                    location,
-                                    id,
-                                    ..
-                                } => {
-                                    diff.deleted += count_lines(
-                                        location,
-                                        id.as_ref().into(),
-                                        *entry_mode,
-                                        tree_index_cache,
-                                        repo,
-                                    );
-                                }
-                                Change::Modification {
-                                    location,
-                                    previous_entry_mode,
-                                    previous_id,
-                                    entry_mode,
-                                    id,
-                                    ..
-                                } => {
-                                    let location = location.as_ref();
-                                    diff.add(diff_two_opt(
-                                        location,
-                                        previous_id.as_ref().to_owned(),
-                                        *previous_entry_mode,
-                                        location,
-                                        id.as_ref().to_owned(),
-                                        *entry_mode,
-                                        tree_index_cache,
-                                        repo,
-                                    ));
-                                }
-                                Change::Rewrite {
-                                    source_location,
-                                    source_entry_mode,
-                                    source_id,
-                                    location,
-                                    entry_mode,
-                                    id,
-                                    copy,
-                                    ..
-                                } => {
-                                    if *copy {
+                                        id,
+                                        ..
+                                    } => {
                                         diff.added += count_lines(
                                             location,
                                             id.as_ref().into(),
@@ -164,11 +133,34 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
                                             tree_index_cache,
                                             repo,
                                         );
-                                    } else {
+                                    }
+                                    Change::Deletion {
+                                        entry_mode,
+                                        location,
+                                        id,
+                                        ..
+                                    } => {
+                                        diff.deleted += count_lines(
+                                            location,
+                                            id.as_ref().into(),
+                                            *entry_mode,
+                                            tree_index_cache,
+                                            repo,
+                                        );
+                                    }
+                                    Change::Modification {
+                                        location,
+                                        previous_entry_mode,
+                                        previous_id,
+                                        entry_mode,
+                                        id,
+                                        ..
+                                    } => {
+                                        let location = location.as_ref();
                                         diff.add(diff_two_opt(
-                                            source_location.as_ref(),
-                                            source_id.as_ref().to_owned(),
-                                            *source_entry_mode,
+                                            location,
+                                            previous_id.as_ref().to_owned(),
+                                            *previous_entry_mode,
                                             location,
                                             id.as_ref().to_owned(),
                                             *entry_mode,
@@ -176,83 +168,127 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
                                             repo,
                                         ));
                                     }
+                                    Change::Rewrite {
+                                        source_location,
+                                        source_entry_mode,
+                                        source_id,
+                                        location,
+                                        entry_mode,
+                                        id,
+                                        copy,
+                                        ..
+                                    } => {
+                                        if *copy {
+                                            diff.added += count_lines(
+                                                location,
+                                                id.as_ref().into(),
+                                                *entry_mode,
+                                                tree_index_cache,
+                                                repo,
+                                            );
+                                        } else {
+                                            diff.add(diff_two_opt(
+                                                source_location.as_ref(),
+                                                source_id.as_ref().to_owned(),
+                                                *source_entry_mode,
+                                                location,
+                                                id.as_ref().to_owned(),
+                                                *entry_mode,
+                                                tree_index_cache,
+                                                repo,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            status::Item::IndexWorktree(change) => {
+                                use gix::status::index_worktree::Item;
+                                use gix::status::plumbing::index_as_worktree::{
+                                    Change, EntryStatus,
+                                };
+                                match change {
+                                    Item::Modification {
+                                        rela_path,
+                                        entry,
+                                        status: EntryStatus::Change(Change::Removed),
+                                        ..
+                                    } => {
+                                        diff.deleted += count_lines(
+                                            rela_path.as_bstr(),
+                                            entry.id,
+                                            entry.mode,
+                                            tree_index_cache,
+                                            repo,
+                                        );
+                                    }
+                                    Item::Modification {
+                                        rela_path,
+                                        entry,
+                                        status:
+                                            EntryStatus::Change(Change::Modification {
+                                                content_change: Some(()),
+                                                ..
+                                            }),
+                                        ..
+                                    } => {
+                                        let location = rela_path.as_bstr();
+                                        diff.add(diff_two_opt(
+                                            location,
+                                            entry.id,
+                                            entry.mode,
+                                            location,
+                                            repo.object_hash().null(),
+                                            entry.mode,
+                                            index_worktree_cache,
+                                            repo,
+                                        ));
+                                    }
+                                    Item::Modification {
+                                        rela_path,
+                                        entry,
+                                        status: EntryStatus::IntentToAdd,
+                                        ..
+                                    } => {
+                                        diff.added += count_lines(
+                                            rela_path.as_bstr(),
+                                            repo.object_hash().null(),
+                                            entry.mode,
+                                            index_worktree_cache,
+                                            repo,
+                                        );
+                                    }
+                                    Item::Rewrite { .. } => {
+                                        unreachable!("not activated")
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
-                        status::Item::IndexWorktree(change) => {
-                            use gix::status::index_worktree::Item;
-                            use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
-                            match change {
-                                Item::Modification {
-                                    rela_path,
-                                    entry,
-                                    status: EntryStatus::Change(Change::Removed),
-                                    ..
-                                } => {
-                                    diff.deleted += count_lines(
-                                        rela_path.as_bstr(),
-                                        entry.id,
-                                        entry.mode,
-                                        tree_index_cache,
-                                        repo,
-                                    );
-                                }
-                                Item::Modification {
-                                    rela_path,
-                                    entry,
-                                    status:
-                                        EntryStatus::Change(Change::Modification {
-                                            content_change: Some(()),
-                                            ..
-                                        }),
-                                    ..
-                                } => {
-                                    let location = rela_path.as_bstr();
-                                    diff.add(diff_two_opt(
-                                        location,
-                                        entry.id,
-                                        entry.mode,
-                                        location,
-                                        repo.object_hash().null(),
-                                        entry.mode,
-                                        index_worktree_cache,
-                                        repo,
-                                    ));
-                                }
-                                Item::Modification {
-                                    rela_path,
-                                    entry,
-                                    status: EntryStatus::IntentToAdd,
-                                    ..
-                                } => {
-                                    diff.added += count_lines(
-                                        rela_path.as_bstr(),
-                                        repo.object_hash().null(),
-                                        entry.mode,
-                                        index_worktree_cache,
-                                        repo,
-                                    );
-                                }
-                                Item::Rewrite { .. } => {
-                                    unreachable!("not activated")
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    diff
-                },
-            )
-            .reduce(Diff::default, |a, b| Diff {
-                added: a.added + b.added,
-                deleted: a.deleted + b.deleted,
-            });
+                        diff
+                    },
+                )
+                .reduce(Diff::default, |a, b| Diff {
+                    added: a.added + b.added,
+                    deleted: a.deleted + b.deleted,
+                });
 
-        GitDiff {
-            added: diff.added.to_string(),
-            deleted: diff.deleted.to_string(),
-        }
+            Some(GitDiff {
+                added: diff.added.to_string(),
+                deleted: diff.deleted.to_string(),
+            })
+        };
     };
+
+    let stats = stats.unwrap_or_default();
+
+    // Cache the result in the session for reuse on the next render.
+    #[cfg(feature = "in-process")]
+    if !cache_avaliable && let Some(ref session) = context.session {
+        let cache_key = repo.workdir.as_deref().unwrap_or(&context.current_dir);
+        let added: usize = stats.added.parse().unwrap_or(0);
+        let deleted: usize = stats.deleted.parse().unwrap_or(0);
+        session.put_git_metrics(cache_key.to_path_buf(), added, deleted);
+    }
 
     let parsed = StringFormatter::new(config.format).and_then(|formatter| {
         formatter

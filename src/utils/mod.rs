@@ -180,6 +180,12 @@ pub fn create_command<T: AsRef<OsStr>>(binary_name: T) -> Result<Command> {
         }
     };
 
+    build_command(&full_path)
+}
+
+/// Build a `Command` from a resolved binary path with stdio pipes set up,
+/// matching the setup in `utils::create_command`.
+pub fn build_command(full_path: &Path) -> std::io::Result<Command> {
     #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(full_path);
     cmd.stderr(Stdio::piped())

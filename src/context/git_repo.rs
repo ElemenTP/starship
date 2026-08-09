@@ -35,7 +35,22 @@ pub struct GitRepo {
     pub(crate) fs_monitor_value_is_true: bool,
 }
 
+impl Clone for GitRepo {
+    fn clone(&self) -> Self {
+        Self {
+            repo: self.repo.clone(),
+            branch: self.branch.clone(),
+            workdir: self.workdir.clone(),
+            path: self.path.clone(),
+            state: None,
+            remote: self.remote.clone(),
+            fs_monitor_value_is_true: self.fs_monitor_value_is_true,
+        }
+    }
+}
+
 /// Remote repository
+#[derive(Clone)]
 pub struct GitRemote {
     pub branch: Option<String>,
     pub name: Option<String>,

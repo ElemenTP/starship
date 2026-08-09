@@ -229,10 +229,19 @@ impl<'a> GitStatusInfo<'a> {
 
     pub fn get_stashed(&self) -> &Option<usize> {
         self.stashed_count.get_or_init(|| {
-            get_stashed_count(self.repo).or_else(|| {
-                log::debug!("get_stashed_count: git stash execution failed");
-                None
-            })
+            #[cfg(not(feature = "in-process"))]
+            {
+                get_stashed_count(self.repo).or_else(|| {
+                    log::debug!("get_stashed_count: git stash execution failed");
+                    None
+                })
+            }
+            // Prefer the session-cached RepoStatus (populated by get_static_repo_status).
+            // This avoids a separate reflog scan when the repo status is already cached.
+            #[cfg(feature = "in-process")]
+            {
+                self.get_repo_status().and_then(|s| s.stashed_count)
+            }
         })
     }
 
@@ -307,6 +316,21 @@ pub fn get_static_repo_status(
     repo: &context::GitRepo,
     config: &GitStatusConfig,
 ) -> Option<Arc<RepoStatus>> {
+    // In-process path: route through the session registry for persistent caching.
+    #[cfg(feature = "in-process")]
+    if let Some(ref session) = context.session {
+        // Determine the repo root for cache keying.
+        let repo_root = repo.workdir.as_deref().unwrap_or(&context.current_dir);
+        if let Some(cached) = session.get_repo_status(repo_root) {
+            return cached;
+        }
+        // Compute fresh.
+        let status = get_repo_status(context, repo, config).map(|s| Arc::new(s));
+        session.put_repo_status(repo_root.to_path_buf(), status.clone());
+        return status;
+    }
+
+    // Default path: process-global static cache (original behavior).
     static REPO_STATUS: parking_lot::Mutex<Option<(Arc<RepoStatus>, PathBuf)>> =
         parking_lot::Mutex::new(None);
     let mut status = REPO_STATUS.lock();
@@ -568,6 +592,12 @@ fn get_repo_status(
         }
     }
 
+    // Bundle stash count into the same status snapshot so it gets
+    // session-cached along with the rest of the repo status.
+    #[cfg(feature = "in-process")]
+    {
+        repo_status.stashed_count = get_stashed_count(repo);
+    }
     Some(repo_status)
 }
 
@@ -606,6 +636,9 @@ fn get_stashed_count(repo: &context::GitRepo) -> Option<usize> {
 pub struct RepoStatus {
     ahead: Option<usize>,
     behind: Option<usize>,
+    /// Number of stash entries (None = couldn't determine).
+    #[cfg(feature = "in-process")]
+    pub(crate) stashed_count: Option<usize>,
     pub(crate) changes: Vec<gix::status::Item>,
     conflicted: usize,
     deleted: usize,

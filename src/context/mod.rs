@@ -1,7 +1,9 @@
 use crate::config::{ModuleConfig, StarshipConfig};
 use crate::configs::StarshipRootConfig;
 use crate::module::Module;
-use crate::utils::{CommandOutput, PathExt, create_command, exec_timeout, read_file};
+use crate::utils::{
+    CommandOutput, PathExt, build_command, create_command, exec_timeout, read_file,
+};
 
 use crate::modules;
 use crate::utils;
@@ -89,6 +91,9 @@ pub struct Context<'a> {
     /// Claude Code session data (when running as statusline)
     pub claude_code_data: Option<Box<ClaudeCodeData>>,
 
+    #[cfg(feature = "in-process")]
+    pub session: Option<Arc<crate::session::SessionState>>,
+
     /// Avoid issues with unused lifetimes when features are disabled
     _marker: PhantomData<&'a ()>,
 }
@@ -98,6 +103,19 @@ impl<'a> Context<'a> {
     /// for it. "logical-path" is used when a shell allows the "current working directory"
     /// to be something other than a file system path (like powershell provider specific paths).
     pub fn new(arguments: Properties, target: Target) -> Self {
+        Self::new_for_session(
+            arguments,
+            target,
+            #[cfg(feature = "in-process")]
+            None,
+        )
+    }
+
+    pub fn new_for_session(
+        arguments: Properties,
+        target: Target,
+        #[cfg(feature = "in-process")] session: Option<Arc<crate::session::SessionState>>,
+    ) -> Self {
         let shell = Context::get_shell();
 
         // Retrieve the "current directory".
@@ -119,26 +137,96 @@ impl<'a> Context<'a> {
             .or_else(|| env::var("PWD").map(PathBuf::from).ok())
             .unwrap_or_else(|| path.clone());
 
-        Self::new_with_shell_and_path(
+        Self::new_with_shell_and_path_with_session(
             arguments,
             shell,
             target,
             path,
             logical_path,
             Default::default(),
+            #[cfg(feature = "in-process")]
+            session,
         )
     }
 
     /// Create a new instance of Context for the provided directory
     pub fn new_with_shell_and_path(
-        mut properties: Properties,
+        properties: Properties,
         shell: Shell,
         target: Target,
         path: PathBuf,
         logical_path: PathBuf,
         env: Env<'a>,
     ) -> Self {
-        let config = StarshipConfig::initialize(get_config_path_os(&env).as_deref());
+        Self::new_with_shell_and_path_with_session(
+            properties,
+            shell,
+            target,
+            path,
+            logical_path,
+            env,
+            #[cfg(feature = "in-process")]
+            None,
+        )
+    }
+
+    pub fn new_with_shell_and_path_with_session(
+        mut properties: Properties,
+        shell: Shell,
+        target: Target,
+        path: PathBuf,
+        logical_path: PathBuf,
+        env: Env<'a>,
+        #[cfg(feature = "in-process")] session: Option<Arc<crate::session::SessionState>>,
+    ) -> Self {
+        #[cfg(not(feature = "in-process"))]
+        let (config, root_config) = {
+            let cfg = StarshipConfig::initialize(get_config_path_os(&env).as_deref());
+            let root = cfg
+                .config
+                .as_ref()
+                .map_or_else(StarshipRootConfig::default, StarshipRootConfig::load);
+            (cfg, root)
+        };
+        #[cfg(feature = "in-process")]
+        let (config, root_config) = {
+            let config_path_os = get_config_path_os(&env);
+            // Try session cache first (includes root_config).
+            let maybe_cached = 'cache: {
+                if let Some(ref session) = session {
+                    if let Some(ref config_path) = config_path_os {
+                        let config_path = PathBuf::from(config_path);
+                        if let Some((cached_cfg, cached_root)) =
+                            session.get_config(&config_path)
+                        {
+                            break 'cache Some(((*cached_cfg).clone(), (*cached_root).clone()));
+                        }
+                    }
+                }
+                None
+            };
+            if let Some(cached) = maybe_cached {
+                cached
+            } else {
+                // Compute fresh.
+                let cfg = StarshipConfig::initialize(config_path_os.as_deref());
+                let root = cfg
+                    .config
+                    .as_ref()
+                    .map_or_else(StarshipRootConfig::default, StarshipRootConfig::load);
+                if let Some(ref session) = session {
+                    if let Some(ref config_path) = config_path_os {
+                        let config_path = PathBuf::from(config_path);
+                        session.put_config(
+                            config_path,
+                            Arc::new(cfg.clone()),
+                            Arc::new(root.clone()),
+                        );
+                    }
+                }
+                (cfg, root)
+            }
+        };
 
         // If the vector is zero-length, we should pretend that we didn't get a
         // pipestatus at all (since this is the input `--pipestatus=""`)
@@ -165,11 +253,6 @@ impl<'a> Context<'a> {
         let current_dir = dunce::canonicalize(&current_dir).unwrap_or(current_dir);
         let logical_dir = logical_path;
 
-        let root_config = config
-            .config
-            .as_ref()
-            .map_or_else(StarshipRootConfig::default, StarshipRootConfig::load);
-
         let width = properties.terminal_width;
 
         Self {
@@ -191,6 +274,8 @@ impl<'a> Context<'a> {
             battery_info_provider: &crate::modules::BatteryInfoProviderImpl,
             root_config,
             claude_code_data: None,
+            #[cfg(feature = "in-process")]
+            session,
             _marker: PhantomData,
         }
     }
@@ -329,81 +414,136 @@ impl<'a> Context<'a> {
     pub fn get_git_repo(&self) -> Result<&GitRepo, &gix::discover::Error> {
         self.git_repo
             .get_or_init(|| -> Result<GitRepo, Box<gix::discover::Error>> {
-                // custom open options
-                let mut git_open_opts_map =
-                    git_sec::trust::Mapping::<gix::open::Options>::default();
-
-                // Load all the configuration as it affects aspects of the
-                // `git_status` and `git_metrics` modules.
-                let config = gix::open::permissions::Config {
-                    git_binary: true,
-                    system: true,
-                    git: true,
-                    user: true,
-                    env: true,
-                    includes: true,
-                };
-                // change options for config permissions without touching anything else
-                git_open_opts_map.reduced =
-                    git_open_opts_map
-                        .reduced
-                        .permissions(gix::open::Permissions {
-                            config,
-                            ..gix::open::Permissions::default_for_level(git_sec::Trust::Reduced)
-                        });
-                git_open_opts_map.full =
-                    git_open_opts_map.full.permissions(gix::open::Permissions {
-                        config,
-                        ..gix::open::Permissions::default_for_level(git_sec::Trust::Full)
-                    });
-
-                let shared_repo =
-                    match ThreadSafeRepository::discover_with_environment_overrides_opts(
-                        &self.current_dir,
-                        gix::discover::upwards::Options {
-                            match_ceiling_dir_or_error: false,
-                            ..Default::default()
-                        },
-                        git_open_opts_map,
-                    ) {
-                        Ok(repo) => repo,
-                        Err(e) => {
-                            log::debug!("Failed to find git repo: {e}");
-                            return Err(Box::new(e));
+                #[cfg(feature = "in-process")]
+                if let Some(ref session) = self.session {
+                    if let Some(cached) = session.get_git_repo(&self.current_dir) {
+                        if let Ok(mut repo) = cached {
+                            let repository = repo.repo.to_thread_local();
+                            repo.state = repository.state();
+                            return Ok(repo);
                         }
+                        // Cached error — fall through to recompute.
+                        log::debug!("Cached git repo error, recomputing");
+                    }
+                }
+
+                let result = discover_git_repo_inner(&self.current_dir);
+
+                #[cfg(feature = "in-process")]
+                if let Some(ref session) = self.session {
+                    let to_cache: Result<GitRepo, String> = match &result {
+                        Ok(repo) => Ok(repo.clone()),
+                        Err(e) => Err(e.to_string()),
                     };
+                    session.put_git_repo(self.current_dir.clone(), &to_cache);
+                }
 
-                let repository = shared_repo.to_thread_local();
-                log::trace!(
-                    "Found git repo: {repository:?}, (trust: {:?})",
-                    repository.git_dir_trust()
-                );
-
-                let branch = get_current_branch(&repository);
-                let remote =
-                    get_remote_repository_info(&repository, branch.as_ref().map(AsRef::as_ref));
-                let path = repository.path().to_path_buf();
-
-                let fs_monitor_value_is_true = repository
-                    .config_snapshot()
-                    .boolean("core.fsmonitor")
-                    .unwrap_or(false);
-
-                Ok(GitRepo {
-                    repo: shared_repo,
-                    branch: branch.map(|b| b.shorten().to_string()),
-                    workdir: repository.workdir().map(PathBuf::from),
-                    path,
-                    state: repository.state(),
-                    remote,
-                    fs_monitor_value_is_true,
-                })
+                result
             })
             .as_ref()
             .map_err(std::convert::AsRef::as_ref)
     }
+}
 
+/// The actual git repo discovery logic, extracted for use with session caching.
+fn discover_git_repo_inner(
+    current_dir: &Path,
+) -> Result<GitRepo, Box<gix::discover::Error>> {
+    // custom open options
+    let mut git_open_opts_map =
+        git_sec::trust::Mapping::<gix::open::Options>::default();
+
+    // Load all the configuration as it affects aspects of the
+    // `git_status` and `git_metrics` modules.
+    let config = gix::open::permissions::Config {
+        git_binary: true,
+        system: true,
+        git: true,
+        user: true,
+        env: true,
+        includes: true,
+    };
+    // change options for config permissions without touching anything else
+    git_open_opts_map.reduced =
+        git_open_opts_map
+            .reduced
+            .permissions(gix::open::Permissions {
+                config,
+                ..gix::open::Permissions::default_for_level(git_sec::Trust::Reduced)
+            });
+    git_open_opts_map.full =
+        git_open_opts_map.full.permissions(gix::open::Permissions {
+            config,
+            ..gix::open::Permissions::default_for_level(git_sec::Trust::Full)
+        });
+
+    let shared_repo =
+        match ThreadSafeRepository::discover_with_environment_overrides_opts(
+            current_dir,
+            gix::discover::upwards::Options {
+                match_ceiling_dir_or_error: false,
+                ..Default::default()
+            },
+            git_open_opts_map,
+        ) {
+            Ok(repo) => repo,
+            Err(e) => {
+                log::debug!("Failed to find git repo: {e}");
+                return Err(Box::new(e));
+            }
+        };
+
+    let repository = shared_repo.to_thread_local();
+    log::trace!(
+        "Found git repo: {repository:?}, (trust: {:?})",
+        repository.git_dir_trust()
+    );
+
+    let branch = get_current_branch(&repository);
+    let remote =
+        get_remote_repository_info(&repository, branch.as_ref().map(AsRef::as_ref));
+    let path = repository.path().to_path_buf();
+
+    let fs_monitor_value_is_true = repository
+        .config_snapshot()
+        .boolean("core.fsmonitor")
+        .unwrap_or(false);
+
+    Ok(GitRepo {
+        repo: shared_repo,
+        branch: branch.map(|b| b.shorten().to_string()),
+        workdir: repository.workdir().map(PathBuf::from),
+        path,
+        state: repository.state(),
+        remote,
+        fs_monitor_value_is_true,
+    })
+}
+
+impl<'a> Context<'a> {
     pub fn dir_contents(&self) -> Result<&DirContents, &std::io::Error> {
+        #[cfg(feature = "in-process")]
+        if let Some(ref session) = self.session {
+            let current_dir = &self.current_dir;
+            let timeout = self.root_config.scan_timeout;
+            let follow_symlinks = self.root_config.follow_symlinks;
+            return self
+                .dir_contents
+                .get_or_init(|| {
+                    if let Some(cached) = session.get_dir_contents(current_dir) {
+                        return cached;
+                    }
+                    let result = DirContents::from_path_with_timeout(
+                        current_dir,
+                        Duration::from_millis(timeout),
+                        follow_symlinks,
+                    );
+                    session.put_dir_contents(current_dir.clone(), &result);
+                    result
+                })
+                .as_ref();
+        }
+
         self.dir_contents
             .get_or_init(|| {
                 let timeout = self.root_config.scan_timeout;
@@ -417,21 +557,24 @@ impl<'a> Context<'a> {
     }
 
     fn get_shell() -> Shell {
-        let shell = env::var("STARSHIP_SHELL").unwrap_or_default();
-        match shell.as_str() {
-            "bash" => Shell::Bash,
-            "fish" => Shell::Fish,
-            "ion" => Shell::Ion,
-            "pwsh" => Shell::Pwsh,
-            "powershell" => Shell::PowerShell,
-            "zsh" => Shell::Zsh,
-            "elvish" => Shell::Elvish,
-            "tcsh" => Shell::Tcsh,
-            "nu" => Shell::Nu,
-            "xonsh" => Shell::Xonsh,
-            "cmd" => Shell::Cmd,
-            _ => Shell::Unknown,
-        }
+        static SHELL: OnceLock<Shell> = OnceLock::new();
+        *SHELL.get_or_init(|| {
+            let shell = env::var("STARSHIP_SHELL").unwrap_or_default();
+            match shell.as_str() {
+                "bash" => Shell::Bash,
+                "fish" => Shell::Fish,
+                "ion" => Shell::Ion,
+                "pwsh" => Shell::Pwsh,
+                "powershell" => Shell::PowerShell,
+                "zsh" => Shell::Zsh,
+                "elvish" => Shell::Elvish,
+                "tcsh" => Shell::Tcsh,
+                "nu" => Shell::Nu,
+                "xonsh" => Shell::Xonsh,
+                "cmd" => Shell::Cmd,
+                _ => Shell::Unknown,
+            }
+        })
     }
 
     // TODO: This should be used directly by clap parse
@@ -440,6 +583,53 @@ impl<'a> Context<'a> {
             .cmd_duration
             .as_deref()
             .and_then(|cd| cd.parse::<u128>().ok())
+    }
+
+    /// Resolve a binary name to a `Command`, using the session binary-path cache
+    /// to skip repeated `which::which` PATH scans for the same binary.
+    #[cfg(feature = "in-process")]
+    fn create_command_cached<T: AsRef<OsStr>>(
+        &self,
+        binary_name: T,
+    ) -> std::io::Result<std::process::Command> {
+        let binary_name: &OsStr = binary_name.as_ref();
+        if let Some(ref session) = self.session {
+            let key = binary_name.to_os_string();
+
+            // Check cache first.
+            if let Some(cached) = session.get_binary_path(&key) {
+                return match cached {
+                    Some(ref full_path) => {
+                        log::trace!("Using cached binary path {full_path:?} for {binary_name:?}");
+                        build_command(full_path)
+                    }
+                    None => {
+                        log::trace!(
+                            "Binary {binary_name:?} cached as not found, skipping PATH scan"
+                        );
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("binary {binary_name:?} not found (cached)"),
+                        ))
+                    }
+                };
+            }
+
+            // Resolve fresh via which.
+            let resolved = which::which(binary_name);
+            let full_path = resolved.ok();
+            session.put_binary_path(key, full_path.clone());
+
+            return match full_path {
+                Some(path) => build_command(&path),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("binary {binary_name:?} not found"),
+                )),
+            };
+        }
+
+        create_command(binary_name)
     }
 
     /// Execute a command and return the output on stdout and stderr if successful
@@ -462,7 +652,10 @@ impl<'a> Context<'a> {
                 return output;
             }
         }
+        #[cfg(not(feature = "in-process"))]
         let mut cmd = create_command(cmd).ok()?;
+        #[cfg(feature = "in-process")]
+        let mut cmd = self.create_command_cached(cmd).ok()?;
         cmd.args(args).current_dir(&self.current_dir);
         exec_timeout(
             &mut cmd,
@@ -528,7 +721,7 @@ fn get_config_path_os(env: &Env) -> Option<OsString> {
     Some(home_dir(env)?.join(".config").join("starship.toml").into())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirContents {
     // HashSet of all files, no folders, relative to the base directory given at construction.
     files: HashSet<PathBuf>,
@@ -893,14 +1086,14 @@ pub struct Properties {
     pub pipestatus: Option<Vec<String>>,
     /// The width of the current interactive terminal.
     #[clap(short = 'w', long, default_value_t=default_width(), value_parser=parse_width)]
-    terminal_width: usize,
+    pub terminal_width: usize,
     /// The path that the prompt should render for.
     #[clap(short, long)]
-    path: Option<PathBuf>,
+    pub path: Option<PathBuf>,
     /// The logical path that the prompt should render for.
     /// This path should be a virtual/logical representation of the PATH argument.
     #[clap(short = 'P', long)]
-    logical_path: Option<PathBuf>,
+    pub logical_path: Option<PathBuf>,
     /// The execution duration of the last command, in milliseconds
     #[clap(short = 'd', long)]
     pub cmd_duration: Option<String>,
