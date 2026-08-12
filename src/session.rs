@@ -108,6 +108,11 @@ impl<T> CacheEntry<T> {
 /// for long. The critical sections are very short — just pointer swaps and
 /// metadata checks.
 pub struct SessionState {
+    /// Scoped rayon thread pool. Wrapped in Option+Mutex so that shutdown()
+    /// can take ownership, send the terminate signal, and then wait for
+    /// worker threads to actually exit before .so unload.
+    rayon_pool: parking_lot::Mutex<Option<rayon::ThreadPool>>,
+
     /// Cached parsed configuration: (path, mtime, size, config, root_config).
     config_cache: parking_lot::Mutex<
         Option<(
@@ -177,7 +182,12 @@ pub struct SessionStats {
 
 impl SessionState {
     pub fn new() -> Self {
+        let rayon_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::num_rayon_threads())
+            .build()
+            .expect("failed to build rayon thread pool");
         Self {
+            rayon_pool: parking_lot::Mutex::new(Some(rayon_pool)),
             config_cache: parking_lot::Mutex::new(None),
             repo_status_cache: parking_lot::Mutex::new(None),
             git_repo_cache: parking_lot::Mutex::new(None),
@@ -532,18 +542,43 @@ impl Session {
 
     /// Render a prompt for the given properties and target.
     ///
-    /// This constructs a `Context` with this session's ID and calls the
-    /// standard `print::get_prompt` pipeline.
+    /// Uses the session's scoped rayon pool so that worker threads can be
+    /// cleanly shut down when the session is destroyed.
     pub fn render(&self, properties: Properties, target: Target) -> String {
         self.state.bump_render();
         let context =
             crate::context::Context::new_for_session(properties, target, Some(self.state.clone()));
-        crate::print::get_prompt(&context)
+        let pool = self.state.rayon_pool.lock();
+        match *pool {
+            Some(ref pool) => pool.install(|| crate::print::get_prompt(&context)),
+            None => {
+                log::warn!("render called after pool shutdown");
+                String::new()
+            }
+        }
     }
 
     /// Return a reference to the session state.
     pub fn state(&self) -> &Arc<SessionState> {
         &self.state
+    }
+
+    /// Shut down the rayon thread pool and wait for all worker threads to
+    /// terminate. Must be called before the shared library is unloaded.
+    ///
+    /// rayon's `ThreadPool::drop()` only signals workers to stop via a
+    /// terminate latch; it does NOT block until threads actually exit.
+    /// We must take ownership of the pool, trigger termination, and then
+    /// wait for threads to finish before dlclose unmaps the .so.
+    pub fn shutdown(&self) {
+        if let Some(pool) = self.state.rayon_pool.lock().take() {
+            let thread_count = pool.current_num_threads();
+            drop(pool); // sends terminate signal to each worker
+            // Workers were idle after the last install() returned, so they
+            // exit within microseconds. A short sleep covers the race.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            log::debug!("rayon pool shutdown complete ({thread_count} workers)");
+        }
     }
 }
 
