@@ -287,7 +287,7 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
         let cache_key = repo.workdir.as_deref().unwrap_or(&context.current_dir);
         let added: usize = stats.added.parse().unwrap_or(0);
         let deleted: usize = stats.deleted.parse().unwrap_or(0);
-        session.put_git_metrics(cache_key.to_path_buf(), added, deleted);
+        session.put_git_metrics(cache_key.to_path_buf(), repo.path.clone(), added, deleted);
     }
 
     let parsed = StringFormatter::new(config.format).and_then(|formatter| {

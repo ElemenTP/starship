@@ -326,7 +326,7 @@ pub fn get_static_repo_status(
         }
         // Compute fresh.
         let status = get_repo_status(context, repo, config).map(|s| Arc::new(s));
-        session.put_repo_status(repo_root.to_path_buf(), status.clone());
+        session.put_repo_status(repo_root.to_path_buf(), repo.path.clone(), status.clone());
         return status;
     }
 

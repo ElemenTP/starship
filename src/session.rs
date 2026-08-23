@@ -108,11 +108,6 @@ impl<T> CacheEntry<T> {
 /// for long. The critical sections are very short — just pointer swaps and
 /// metadata checks.
 pub struct SessionState {
-    /// Scoped rayon thread pool. Wrapped in Option+Mutex so that shutdown()
-    /// can take ownership, send the terminate signal, and then wait for
-    /// worker threads to actually exit before .so unload.
-    rayon_pool: parking_lot::Mutex<Option<rayon::ThreadPool>>,
-
     /// Cached parsed configuration: (path, mtime, size, config, root_config).
     config_cache: parking_lot::Mutex<
         Option<(
@@ -182,12 +177,7 @@ pub struct SessionStats {
 
 impl SessionState {
     pub fn new() -> Self {
-        let rayon_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(crate::num_rayon_threads())
-            .build()
-            .expect("failed to build rayon thread pool");
         Self {
-            rayon_pool: parking_lot::Mutex::new(Some(rayon_pool)),
             config_cache: parking_lot::Mutex::new(None),
             repo_status_cache: parking_lot::Mutex::new(None),
             git_repo_cache: parking_lot::Mutex::new(None),
@@ -297,11 +287,11 @@ impl SessionState {
     pub fn put_repo_status(
         &self,
         repo_root: PathBuf,
+        git_dir: PathBuf,
         status: Option<Arc<crate::modules::git_status::RepoStatus>>,
     ) {
         // Build invalidation file list: .git/index, HEAD, packed-refs.
         let inval_files = {
-            let git_dir = repo_root.join(".git");
             vec![
                 (git_dir.join("index"), mtime_of(&git_dir.join("index"))),
                 (git_dir.join("HEAD"), mtime_of(&git_dir.join("HEAD"))),
@@ -383,9 +373,14 @@ impl SessionState {
         None
     }
 
-    pub fn put_git_metrics(&self, repo_root: PathBuf, added: usize, deleted: usize) {
+    pub fn put_git_metrics(
+        &self,
+        repo_root: PathBuf,
+        git_dir: PathBuf,
+        added: usize,
+        deleted: usize,
+    ) {
         let inval_files = {
-            let git_dir = repo_root.join(".git");
             vec![
                 (git_dir.join("index"), mtime_of(&git_dir.join("index"))),
                 (git_dir.join("HEAD"), mtime_of(&git_dir.join("HEAD"))),
@@ -477,6 +472,16 @@ impl SessionState {
 
     pub fn put_binary_path(&self, binary_name: OsString, path: Option<PathBuf>) {
         let mut cache = self.binary_cache.lock();
+        let mut to_remove: Vec<OsString> = Vec::new();
+        let ttl = Self::ttl();
+        for (key, val) in cache.iter() {
+            if val.1.elapsed() > ttl {
+                to_remove.push(key.clone());
+            }
+        }
+        for key in to_remove.iter(){
+            cache.remove(key);
+        }
         cache.insert(binary_name, (path, Instant::now()));
     }
 
@@ -530,14 +535,26 @@ fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
 /// The FFI host creates one `Session` per shell session (via `ssp_session_create`),
 /// holds it for the lifetime of the shell, and calls `render()` on every prompt.
 pub struct Session {
+    /// Scoped rayon thread pool. Wrapped in Option+Mutex so that shutdown()
+    /// can take ownership, send the terminate signal, and then wait for
+    /// worker threads to actually exit before .so unload.
+    rayon_pool: parking_lot::Mutex<Option<rayon::ThreadPool>>,
+
     state: Arc<SessionState>,
 }
 
 impl Session {
     /// Create a new session and register it in the global registry.
     pub fn new() -> Self {
+        let rayon_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::num_rayon_threads())
+            .build()
+            .expect("failed to build rayon thread pool");
         let state = Arc::new(SessionState::new());
-        Self { state }
+        Self {
+            rayon_pool: parking_lot::Mutex::new(Some(rayon_pool)),
+            state: state,
+        }
     }
 
     /// Render a prompt for the given properties and target.
@@ -548,7 +565,7 @@ impl Session {
         self.state.bump_render();
         let context =
             crate::context::Context::new_for_session(properties, target, Some(self.state.clone()));
-        let pool = self.state.rayon_pool.lock();
+        let pool = self.rayon_pool.lock();
         match *pool {
             Some(ref pool) => pool.install(|| crate::print::get_prompt(&context)),
             None => {
@@ -562,16 +579,19 @@ impl Session {
     pub fn state(&self) -> &Arc<SessionState> {
         &self.state
     }
+}
 
-    /// Shut down the rayon thread pool and wait for all worker threads to
-    /// terminate. Must be called before the shared library is unloaded.
-    ///
-    /// rayon's `ThreadPool::drop()` only signals workers to stop via a
-    /// terminate latch; it does NOT block until threads actually exit.
-    /// We must take ownership of the pool, trigger termination, and then
-    /// wait for threads to finish before dlclose unmaps the .so.
-    pub fn shutdown(&self) {
-        if let Some(pool) = self.state.rayon_pool.lock().take() {
+/// Shut down the rayon thread pool and wait for all worker threads to
+/// terminate.
+///
+/// rayon's `ThreadPool::drop()` only signals workers to stop via a
+/// terminate latch; it does NOT block until threads actually exit.
+/// Unfortunately rayon does not provide a way to join threads.
+/// We must take ownership of the pool, trigger termination, and then
+/// wait for threads to finish before dlclose unmaps the library.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(pool) = self.rayon_pool.lock().take() {
             let thread_count = pool.current_num_threads();
             drop(pool); // sends terminate signal to each worker
             // Workers were idle after the last install() returned, so they
