@@ -479,7 +479,7 @@ impl SessionState {
                 to_remove.push(key.clone());
             }
         }
-        for key in to_remove.iter(){
+        for key in to_remove.iter() {
             cache.remove(key);
         }
         cache.insert(binary_name, (path, Instant::now()));
@@ -545,33 +545,30 @@ pub struct Session {
 
 impl Session {
     /// Create a new session and register it in the global registry.
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, rayon::ThreadPoolBuildError> {
         let rayon_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(crate::num_rayon_threads())
-            .build()
-            .expect("failed to build rayon thread pool");
+            .build()?;
+
         let state = Arc::new(SessionState::new());
-        Self {
+        Ok(Self {
             rayon_pool: parking_lot::Mutex::new(Some(rayon_pool)),
             state: state,
-        }
+        })
     }
 
     /// Render a prompt for the given properties and target.
     ///
     /// Uses the session's scoped rayon pool so that worker threads can be
     /// cleanly shut down when the session is destroyed.
-    pub fn render(&self, properties: Properties, target: Target) -> String {
+    pub fn render(&self, properties: Properties, target: Target) -> Result<String, String> {
         self.state.bump_render();
         let context =
             crate::context::Context::new_for_session(properties, target, Some(self.state.clone()));
         let pool = self.rayon_pool.lock();
         match *pool {
-            Some(ref pool) => pool.install(|| crate::print::get_prompt(&context)),
-            None => {
-                log::warn!("render called after pool shutdown");
-                String::new()
-            }
+            Some(ref pool) => Ok(pool.install(|| crate::print::get_prompt(&context))),
+            None => Err(String::from("render called after pool shutdown")),
         }
     }
 
