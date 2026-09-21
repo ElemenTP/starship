@@ -137,11 +137,11 @@ pub struct SessionState {
     binary_cache: parking_lot::Mutex<HashMap<OsString, (Option<PathBuf>, Instant)>>,
 
     /// Cache hit/miss counters.
-    stats: SessionStatsStatus,
+    stats: SessionStatsCounters,
 }
 
 #[derive(Debug, Default)]
-pub struct SessionStatsStatus {
+pub struct SessionStatsCounters {
     pub config_hits: atomic::AtomicU64,
     pub config_misses: atomic::AtomicU64,
     pub repo_status_hits: atomic::AtomicU64,
@@ -184,7 +184,7 @@ impl SessionState {
             dir_contents_cache: parking_lot::Mutex::new(None),
             git_metrics_cache: parking_lot::Mutex::new(None),
             binary_cache: parking_lot::Mutex::new(HashMap::new()),
-            stats: SessionStatsStatus::default(),
+            stats: SessionStatsCounters::default(),
         }
     }
 
