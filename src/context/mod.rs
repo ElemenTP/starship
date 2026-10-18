@@ -1,9 +1,9 @@
 use crate::config::{ModuleConfig, StarshipConfig};
 use crate::configs::StarshipRootConfig;
 use crate::module::Module;
-use crate::utils::{
-    CommandOutput, PathExt, build_command, create_command, exec_timeout, read_file,
-};
+#[cfg(feature = "in-process")]
+use crate::utils::build_command;
+use crate::utils::{CommandOutput, PathExt, create_command, exec_timeout, read_file};
 
 use crate::modules;
 use crate::utils;
@@ -67,7 +67,7 @@ pub struct Context<'a> {
     git_repo: OnceLock<Result<GitRepo, gix::Error>>,
 
     /// Private field to store JJ information for modules who need it
-    jj_repo: OnceLock<Option<JJRepo>>,
+    jj_repo: OnceLock<Option<Arc<JJRepo>>>,
 
     /// The shell the user is assumed to be running
     pub shell: Shell,
@@ -518,7 +518,27 @@ impl<'a> Context<'a> {
 
     /// Will lazily discover Jujutsu repo root when a module requests it.
     pub fn get_jj_repo(&self) -> Option<&JJRepo> {
-        self.jj_repo.get_or_init(|| JJRepo::discover(self)).as_ref()
+        self.jj_repo
+            .get_or_init(|| {
+                #[cfg(feature = "in-process")]
+                if let Some(ref session) = self.session {
+                    if let Some(cached) = session.get_jj_repo(&self.current_dir) {
+                        return Some(cached);
+                    }
+                }
+
+                let discovered = JJRepo::discover(self).map(Arc::new);
+
+                #[cfg(feature = "in-process")]
+                if let Some(ref session) = self.session {
+                    if let Some(ref repo) = discovered {
+                        session.put_jj_repo(self.current_dir.clone(), repo);
+                    }
+                }
+
+                discovered
+            })
+            .as_deref()
     }
 
     #[cfg(test)]
@@ -530,7 +550,7 @@ impl<'a> Context<'a> {
 
     #[cfg(test)]
     pub fn set_jj_repo(&mut self, repo: JJRepo) {
-        self.jj_repo = OnceLock::from(Some(repo));
+        self.jj_repo = OnceLock::from(Some(Arc::new(repo)));
     }
 
     pub fn dir_contents(&self) -> Result<&DirContents, &std::io::Error> {

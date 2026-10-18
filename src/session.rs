@@ -28,7 +28,7 @@
 
 use crate::config::StarshipConfig;
 use crate::configs::StarshipRootConfig;
-use crate::context::{DirContents, GitRepo, Properties, Target};
+use crate::context::{DirContents, GitRepo, JJRepo, Properties, Target};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,9 @@ pub struct SessionState {
     /// Cached git repository discovery result (ancestor walk + config load).
     git_repo_cache: parking_lot::Mutex<Option<CacheEntry<Result<GitRepo, String>>>>,
 
+    /// Cached Jujutsu repository discovery/current-change state.
+    jj_repo_cache: parking_lot::Mutex<Option<CacheEntry<Arc<JJRepo>>>>,
+
     /// Cached git metrics result (blob diff line counts).
     /// Keyed by repo root with the same invalidation as repo_status_cache.
     git_metrics_cache: parking_lot::Mutex<Option<CacheEntry<(usize, usize)>>>,
@@ -150,6 +153,8 @@ pub struct SessionStatsCounters {
     pub git_repo_misses: atomic::AtomicU64,
     pub git_metrics_hits: atomic::AtomicU64,
     pub git_metrics_misses: atomic::AtomicU64,
+    pub jj_repo_hits: atomic::AtomicU64,
+    pub jj_repo_misses: atomic::AtomicU64,
     pub dir_contents_hits: atomic::AtomicU64,
     pub dir_contents_misses: atomic::AtomicU64,
     pub binary_path_hits: atomic::AtomicU64,
@@ -168,6 +173,8 @@ pub struct SessionStats {
     pub git_repo_misses: u64,
     pub git_metrics_hits: u64,
     pub git_metrics_misses: u64,
+    pub jj_repo_hits: u64,
+    pub jj_repo_misses: u64,
     pub dir_contents_hits: u64,
     pub dir_contents_misses: u64,
     pub binary_path_hits: u64,
@@ -181,6 +188,7 @@ impl SessionState {
             config_cache: parking_lot::Mutex::new(None),
             repo_status_cache: parking_lot::Mutex::new(None),
             git_repo_cache: parking_lot::Mutex::new(None),
+            jj_repo_cache: parking_lot::Mutex::new(None),
             dir_contents_cache: parking_lot::Mutex::new(None),
             git_metrics_cache: parking_lot::Mutex::new(None),
             binary_cache: parking_lot::Mutex::new(HashMap::new()),
@@ -290,6 +298,13 @@ impl SessionState {
         git_dir: PathBuf,
         status: Option<Arc<crate::modules::git_status::RepoStatus>>,
     ) {
+        // Do not cache failures: a `None` status is usually a transient
+        // timeout/error, and caching it would hide git status (and metrics)
+        // for the whole TTL. A later render should retry the computation.
+        let Some(status) = status else {
+            return;
+        };
+
         // Build invalidation file list: .git/index, HEAD, packed-refs.
         let inval_files = {
             vec![
@@ -303,7 +318,7 @@ impl SessionState {
         };
 
         let entry =
-            CacheEntry::new(status, repo_root, Instant::now()).with_invalidation(inval_files);
+            CacheEntry::new(Some(status), repo_root, Instant::now()).with_invalidation(inval_files);
         let mut cache = self.repo_status_cache.lock();
         *cache = Some(entry);
     }
@@ -340,8 +355,64 @@ impl SessionState {
     }
 
     pub fn put_git_repo(&self, dir: PathBuf, result: &Result<GitRepo, String>) {
-        let entry = CacheEntry::new(result.clone(), dir, Instant::now());
+        // The cached GitRepo contains branch/remote/state. Invalidate it when
+        // refs or config change so a checkout/fetch is reflected immediately
+        // instead of waiting for the TTL.
+        let invalidation_files = match result {
+            Ok(repo) => git_reference_invalidation_files(&repo.path),
+            Err(_) => Vec::new(),
+        };
+        let entry = CacheEntry::new(result.clone(), dir, Instant::now())
+            .with_invalidation(invalidation_files);
         let mut cache = self.git_repo_cache.lock();
+        *cache = Some(entry);
+    }
+
+    // -- Jujutsu repo cache -------------------------------------------------
+
+    /// Look up a cached Jujutsu repository for `dir`.
+    ///
+    /// The cached `JJRepo` also owns its `OnceLock<Option<CurrentChange>>`, so
+    /// a cache hit also reuses the result of the expensive `jj show` call.
+    pub fn get_jj_repo(&self, dir: &Path) -> Option<Arc<JJRepo>> {
+        if Self::no_cache() {
+            self.stats
+                .jj_repo_misses
+                .fetch_add(1, atomic::Ordering::Relaxed);
+            return None;
+        }
+
+        let cache = self.jj_repo_cache.lock();
+        if let Some(ref entry) = *cache {
+            if entry.path == dir && entry.is_valid(Self::ttl()) {
+                self.stats
+                    .jj_repo_hits
+                    .fetch_add(1, atomic::Ordering::Relaxed);
+                return Some(entry.value.clone());
+            }
+        }
+
+        self.stats
+            .jj_repo_misses
+            .fetch_add(1, atomic::Ordering::Relaxed);
+        None
+    }
+
+    pub fn put_jj_repo(&self, dir: PathBuf, repo: &Arc<JJRepo>) {
+        let jj_dir = repo.root().join(".jj");
+        let invalidation_files = vec![
+            (
+                jj_dir.join("working_copy"),
+                mtime_of(&jj_dir.join("working_copy")),
+            ),
+            (
+                jj_dir.join("repo").join("op_heads"),
+                mtime_of(&jj_dir.join("repo").join("op_heads")),
+            ),
+        ];
+        let entry = CacheEntry::new(repo.clone(), dir, Instant::now())
+            .with_invalidation(invalidation_files);
+        let mut cache = self.jj_repo_cache.lock();
         *cache = Some(entry);
     }
 
@@ -507,6 +578,8 @@ impl SessionState {
                 .stats
                 .git_metrics_misses
                 .load(atomic::Ordering::Relaxed),
+            jj_repo_hits: self.stats.jj_repo_hits.load(atomic::Ordering::Relaxed),
+            jj_repo_misses: self.stats.jj_repo_misses.load(atomic::Ordering::Relaxed),
             dir_contents_hits: self.stats.dir_contents_hits.load(atomic::Ordering::Relaxed),
             dir_contents_misses: self
                 .stats
@@ -524,6 +597,30 @@ impl SessionState {
 
 fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Files/directories that can change the cached `GitRepo`'s branch, remote, or
+/// in-progress state. `HEAD` catches checkouts; refs/packed-refs catch branch
+/// and remote-tracking updates; `config` catches remote/config edits;
+/// `FETCH_HEAD` catches fetches.
+fn git_reference_invalidation_files(
+    git_dir: &Path,
+) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    [
+        "HEAD",
+        "packed-refs",
+        "config",
+        "FETCH_HEAD",
+        "refs",
+        "logs/refs",
+    ]
+    .iter()
+    .map(|name| {
+        let path = git_dir.join(name);
+        let mtime = mtime_of(&path);
+        (path, mtime)
+    })
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -606,3 +703,27 @@ impl Drop for Session {
 /// Re-exported so that `SessionState` can store `RepoStatus` without
 /// the `git_status` module needing to depend on `session`.
 pub use crate::modules::git_status::RepoStatus;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn jj_repo_cache_roundtrip() {
+        let state = SessionState::new();
+        let root = PathBuf::from("/tmp/starship-jj-cache-test");
+        let repo = Arc::new(JJRepo::with_root(root.clone()));
+
+        assert!(state.get_jj_repo(&root).is_none());
+        state.put_jj_repo(root.clone(), &repo);
+
+        let cached = state.get_jj_repo(&root).expect("jj repo cache hit");
+        assert_eq!(cached.root(), root.as_path());
+        assert!(
+            state
+                .get_jj_repo(Path::new("/tmp/starship-jj-cache-other"))
+                .is_none()
+        );
+    }
+}
